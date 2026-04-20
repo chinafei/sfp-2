@@ -11,7 +11,7 @@ import optuna
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src.dual_tower_model import DualTowerBiddingModel, PenaltyBiddingLoss
-from src.data_loader import NPYDataLoader, save_model_params
+from src.data_loader import NPYDataLoader, save_model_params, save_normalizer
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -26,7 +26,7 @@ def get_data():
     if train_ds is None:
         logging.error("无法加载真实数据，请先运行 --build 构建 NPY 数据集")
         sys.exit(1)
-    return train_ds, val_ds, seq_dim, static_dim
+    return loader, train_ds, val_ds, seq_dim, static_dim
 
 def train_and_validate(model, train_loader, val_loader, optimizer, criterion, epochs=50, device='cpu'):
     best_val_loss = float('inf')
@@ -124,7 +124,7 @@ def main():
 
     # 加载数据
     logging.info("加载训练数据...")
-    train_ds, val_ds, seq_dim, static_dim = get_data()
+    loader, train_ds, val_ds, seq_dim, static_dim = get_data()
 
     # ── Optuna 调参 ──────────────────────────────────────
     logging.info(f"开始 Optuna 调参 ({args.tune_trials} trials)...")
@@ -144,6 +144,7 @@ def main():
 
     # 保存 best_params（含 hidden_dim）
     save_model_params(results_dir, best_params)
+    save_normalizer(results_dir, loader)
 
     # ── 全量训练 ─────────────────────────────────────────
     logging.info("开始全量训练...")

@@ -25,7 +25,9 @@ GET /health
 ```json
 {
   "status": "ok",
+  "baseline_loaded": true,
   "model_loaded": true,
+  "active_backend": "history_baseline",
   "startup_done": true,
   "startup_error": null,
   "hidden_dim": 128,
@@ -39,7 +41,9 @@ GET /health
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | status | string | `"ok"` 表示服务就绪，`"loading"` 表示模型加载中 |
+| baseline_loaded | bool | 历史强基线是否已加载完成 |
 | model_loaded | bool | 模型是否已加载完成 |
+| active_backend | string/null | 当前默认预测后端，可能为 `history_baseline` 或 `dual_tower` |
 | startup_done | bool | 启动流程是否全部完成 |
 | startup_error | string/null | 启动错误信息，null 表示正常 |
 
@@ -52,7 +56,7 @@ GET /health
 **请求**
 
 ```
-POST /predict?date=YYYY-MM-DD
+POST /predict?date=YYYY-MM-DD&predictor=auto
 ```
 
 **参数**
@@ -60,6 +64,7 @@ POST /predict?date=YYYY-MM-DD
 | 参数 | 位置 | 必填 | 说明 | 示例 |
 |------|------|------|------|------|
 | date | query | 是 | 预测目标日期，格式 YYYY-MM-DD | 2026-03-05 |
+| predictor | query | 否 | 预测后端，可选 `auto`、`history_baseline`、`dual_tower`；默认 `auto`，生产默认优先走历史强基线 | auto |
 
 **响应示例**
 
@@ -93,7 +98,7 @@ POST /predict?date=YYYY-MM-DD
       "市场出清价格_预测均价": 9.012
     }
   },
-  "model_version": "hidden_dim=128",
+  "model_version": "history_baseline(prev_day_partial_fallback)",
   "generated_at": "2026-03-04T18:30:00.123456"
 }
 ```
@@ -277,8 +282,11 @@ GET /results/{filename}
 # 健康检查
 curl http://112.126.80.142:9527/health
 
-# 预测 2026-03-05
-curl -X POST "http://112.126.80.142:9527/predict?date=2026-03-05"
+# 预测 2026-03-05（默认强基线）
+curl -X POST "http://112.126.80.142:9527/predict?date=2026-03-05&predictor=auto"
+
+# 显式使用 DualTower
+curl -X POST "http://112.126.80.142:9527/predict?date=2026-03-05&predictor=dual_tower"
 
 # 更新数据后重建
 curl -X POST http://112.126.80.142:9527/datasets/rebuild
@@ -301,7 +309,10 @@ import requests
 BASE_URL = "http://112.126.80.142:9527"
 
 # 预测
-resp = requests.post(f"{BASE_URL}/predict", params={"date": "2026-03-05"})
+resp = requests.post(
+    f"{BASE_URL}/predict",
+    params={"date": "2026-03-05", "predictor": "auto"},
+)
 data = resp.json()
 
 for seg, vals in data["segments"].items():

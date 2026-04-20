@@ -17,8 +17,7 @@ import sys
 import json
 import logging
 import threading
-from datetime import datetime, date
-from typing import Optional
+from datetime import datetime
 
 # ── 路径配置 ──────────────────────────────────────────────
 APP_DIR   = os.path.dirname(os.path.abspath(__file__))
@@ -30,7 +29,6 @@ CHECKPOINT_DIR = os.path.join(SFP2_DIR, "checkpoints")
 sys.path.insert(0, SFP2_DIR)
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 import numpy as np
@@ -46,8 +44,8 @@ logger = logging.getLogger(__name__)
 # ── FastAPI 应用 ─────────────────────────────────────────
 app = FastAPI(
     title="SFP-2 二次调频预测服务",
-    description="基于 DualTower 模型预测调频容量需求、边际排序价格、市场出清均价",
-    version="1.0.0",
+    description="基于历史强基线或 DualTower 模型预测调频容量需求、边际排序价格、市场出清均价",
+    version="1.1.0",
 )
 
 # ── 全局状态 ──────────────────────────────────────────────
@@ -56,9 +54,12 @@ class State:
     model_loaded = False
     model_params = {}
     data_loader = None
+    baseline_predictor = None
+    baseline_loaded = False
     hidden_dim = 64
     seq_dim = 12
     static_dim = 4
+    active_backend = None
     startup_done = False
     startup_error = None
 
@@ -102,25 +103,47 @@ def build_npy_background():
 
 def build_npy_on_demand():
     """按需构建 NPY（当日数据刚挂载时调用）"""
-    try:
-        import subprocess
-        script = os.path.join(APP_DIR, "scripts", "build_npy_datasets.py")
-        result = subprocess.run(
-            [sys.executable, script],
-            capture_output=True, text=True, timeout=3600,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr[-500:])
-        logger.info("[NPY Build] 按需构建完成")
-    except Exception as e:
-        logger.warning(f"[NPY Build] 按需构建失败: {e}")
+    import subprocess
+
+    script = os.path.join(APP_DIR, "scripts", "build_npy_datasets.py")
+    result = subprocess.run(
+        [sys.executable, script],
+        capture_output=True, text=True, timeout=3600,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr[-500:])
+    logger.info("[NPY Build] 按需构建完成")
 
 
 # ── 内部: 加载模型 ────────────────────────────────────────
 
+def load_baseline_predictor():
+    """加载历史强基线预测器。"""
+    from src.data_loader import NPYDataLoader
+    from src.history_baseline_predictor import HistoryBaselinePredictor
+
+    logger.info("[Baseline] 加载中...")
+
+    loader = NPYDataLoader(NPY_BASE)
+    health = loader.check_health()
+    if not health["ok"]:
+        raise RuntimeError(f"NPY 数据缺失: {health['missing']}")
+
+    predictor = HistoryBaselinePredictor(NPY_BASE)
+    state.baseline_predictor = predictor
+    state.baseline_loaded = True
+    state.data_loader = loader
+    if state.active_backend is None:
+        state.active_backend = "history_baseline"
+    logger.info(
+        "[Baseline] 加载完成 "
+        f"(available_days={len(predictor.available_days)}, complete_days={len(predictor.complete_days)})"
+    )
+
+
 def load_model():
-    """加载 DualTower 模型和参数"""
-    from src.data_loader import load_model_params, SEQ_DIM, STATIC_DIM, NPYDataLoader
+    """加载 DualTower 模型和参数。"""
+    from src.data_loader import SEQ_DIM, STATIC_DIM, NPYDataLoader
     from src.dual_tower_model import DualTowerBiddingModel
 
     logger.info("[Model] 加载中...")
@@ -186,10 +209,10 @@ SEGMENT_PMIN = [5.0, 5.0, 10.0, 10.0, 5.0]
 SEGMENT_PMAX = [10.0, 10.0, 15.0, 15.0, 10.0]
 
 
-def do_predict(target_date_str: str):
-    """执行单日预测，返回 dict"""
+def do_predict_dual_tower(target_date_str: str):
+    """使用 DualTower 执行单日预测。"""
     if not state.model_loaded:
-        raise HTTPException(503, "模型未加载，服务尚未就绪")
+        raise HTTPException(503, "DualTower 模型未加载，服务尚未就绪")
 
     loader = state.data_loader
     x_seq, x_static, warnings = loader.load_features_for_date(target_date_str)
@@ -205,11 +228,9 @@ def do_predict(target_date_str: str):
     with torch.no_grad():
         out_scaled, _ = state.model(xs_t, xst_t)
 
-    # 物理值反归一化
     scales_t = torch.tensor([4000.0, 10.0, 10.0], dtype=torch.float32).to(device)
     out_phys = out_scaled * scales_t.view(1, 1, 3)
 
-    # 价格钳位
     pmin_t = torch.tensor(SEGMENT_PMIN, dtype=torch.float32).unsqueeze(0).unsqueeze(-1).to(device)
     pmax_t = torch.tensor(SEGMENT_PMAX, dtype=torch.float32).unsqueeze(0).unsqueeze(-1).to(device)
     out_clipped = out_phys.clone()
@@ -218,8 +239,7 @@ def do_predict(target_date_str: str):
     )
     out_np = out_clipped[0].cpu().numpy()
 
-    # 构建输出
-    segments    = ["T1", "T2", "T3", "T4", "T5"]
+    segments = ["T1", "T2", "T3", "T4", "T5"]
     metric_keys = ["调频容量需求", "边际排序价格", "市场出清价格_预测均价"]
 
     result = {"date": target_date_str, "segments": {}}
@@ -229,15 +249,89 @@ def do_predict(target_date_str: str):
             metric_keys[1]: round(float(out_np[i, 1]), 3),
             metric_keys[2]: round(float(out_np[i, 2]), 3),
         }
-
     return result
+
+
+def do_predict_history_baseline(target_date_str: str):
+    """使用历史强基线执行单日预测。"""
+    if not state.baseline_loaded or state.baseline_predictor is None:
+        raise HTTPException(503, "历史基线未加载，服务尚未就绪")
+    return state.baseline_predictor.predict(target_date_str)
+
+
+def resolve_backend(prefer: str) -> str:
+    """解析本次请求使用的预测后端。"""
+    if prefer == "history_baseline":
+        if not state.baseline_loaded:
+            raise HTTPException(503, "历史基线未加载")
+        return "history_baseline"
+
+    if prefer == "dual_tower":
+        if not state.model_loaded:
+            raise HTTPException(503, "DualTower 模型未加载")
+        return "dual_tower"
+
+    if prefer == "auto":
+        if state.baseline_loaded:
+            return "history_baseline"
+        if state.model_loaded:
+            return "dual_tower"
+        raise HTTPException(503, "没有可用的预测后端")
+
+    raise HTTPException(400, f"不支持的 predictor: {prefer}")
+
+
+def do_predict(target_date_str: str, backend: str):
+    """执行单日预测，返回 (result, model_version)。"""
+    if backend == "history_baseline":
+        return (
+            do_predict_history_baseline(target_date_str),
+            "history_baseline(prev_day_partial_fallback)",
+        )
+    if backend == "dual_tower":
+        return (
+            do_predict_dual_tower(target_date_str),
+            f"dual_tower(hidden_dim={state.hidden_dim})",
+        )
+    raise HTTPException(400, f"未知预测后端: {backend}")
+
+
+def write_prediction_files(target_date_str: str, backend: str, result: dict) -> str:
+    """写入兼容结果文件和后端专属结果文件。"""
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+
+    result_for_file = {
+        "date": result["date"],
+        "predictor": backend,
+        "segments": {
+            seg: {
+                "调频容量需求": vals["调频容量需求"],
+                "边际排序价格": vals["边际排序价格"],
+                "市场出清价格(预测均价)": vals["市场出清价格_预测均价"],
+            }
+            for seg, vals in result["segments"].items()
+        },
+    }
+
+    backend_json_path = os.path.join(
+        RESULTS_DIR,
+        f"prediction_{target_date_str}_{backend}.json",
+    )
+    with open(backend_json_path, "w", encoding="utf-8") as f:
+        json.dump(result_for_file, f, ensure_ascii=False, indent=4)
+
+    canonical_json_path = os.path.join(RESULTS_DIR, f"prediction_{target_date_str}.json")
+    with open(canonical_json_path, "w", encoding="utf-8") as f:
+        json.dump(result_for_file, f, ensure_ascii=False, indent=4)
+
+    return canonical_json_path
 
 
 # ── 启动事件 ──────────────────────────────────────────────
 
 @app.on_event("startup")
 def startup_event():
-    """服务启动时：后台构建 NPY + 加载模型"""
+    """服务启动时：后台构建 NPY + 加载预测后端。"""
     def background_tasks():
         try:
             # 后台构建 NPY（增量）
@@ -245,16 +339,34 @@ def startup_event():
         except Exception as e:
             logger.warning(f"[NPY] 后台构建跳过: {e}")
 
+        startup_errors = []
+
         try:
-            # 加载模型
+            load_baseline_predictor()
+            state.active_backend = "history_baseline"
+        except Exception as e:
+            startup_errors.append(f"baseline={e}")
+            logger.error(f"[Baseline] 加载失败: {e}")
+
+        try:
             load_model()
         except Exception as e:
-            state.startup_error = str(e)
+            startup_errors.append(f"dual_tower={e}")
             logger.error(f"[Model] 加载失败: {e}")
+
+        if state.baseline_loaded and state.model_loaded:
+            state.active_backend = "history_baseline"
+        elif state.baseline_loaded:
+            state.active_backend = "history_baseline"
+        elif state.model_loaded:
+            state.active_backend = "dual_tower"
+        else:
+            state.startup_error = "; ".join(startup_errors) or "没有可用的预测后端"
             return
 
         state.startup_done = True
-        logger.info("[Startup] 服务就绪")
+        state.startup_error = "; ".join(startup_errors) if startup_errors else None
+        logger.info(f"[Startup] 服务就绪 (active_backend={state.active_backend})")
 
     t = threading.Thread(target=background_tasks, daemon=True)
     t.start()
@@ -266,8 +378,10 @@ def startup_event():
 def health_check():
     """健康检查"""
     return {
-        "status": "ok" if state.model_loaded else "loading",
+        "status": "ok" if (state.baseline_loaded or state.model_loaded) else "loading",
         "model_loaded": state.model_loaded,
+        "baseline_loaded": state.baseline_loaded,
+        "active_backend": state.active_backend,
         "startup_done": state.startup_done,
         "startup_error": state.startup_error,
         "hidden_dim": state.hidden_dim,
@@ -311,10 +425,20 @@ def datasets_rebuild():
     """手动触发 NPY 重建（当挂载了新数据时）"""
     try:
         build_npy_on_demand()
-        # 重建后重新加载模型
-        if state.model_loaded:
-            state.model_loaded = False
+        state.baseline_loaded = False
+        state.model_loaded = False
+        state.baseline_predictor = None
+        state.model = None
+        state.active_backend = None
+        state.startup_error = None
+        load_baseline_predictor()
+        state.active_backend = "history_baseline"
+        try:
             load_model()
+            state.startup_error = None
+        except Exception as e:
+            state.startup_error = f"dual_tower={e}"
+            logger.error(f"[Model] 重载失败: {e}")
         return {"status": "ok", "message": "NPY 重建完成，模型已重新加载"}
     except Exception as e:
         raise HTTPException(500, str(e))
@@ -323,6 +447,11 @@ def datasets_rebuild():
 @app.post("/predict")
 def predict(
     date: str = Query(..., description="预测日期 YYYY-MM-DD", example="2026-03-05"),
+    predictor: str = Query(
+        "auto",
+        description="预测后端: auto | history_baseline | dual_tower",
+        example="auto",
+    ),
 ):
     """
     预测指定日期的二次调频指标
@@ -332,7 +461,7 @@ def predict(
       - 边际排序价格 (元/MW)
       - 市场出清价格/预测均价 (元/MW)
     """
-    if not state.startup_done and not state.model_loaded:
+    if not state.startup_done and not (state.baseline_loaded or state.model_loaded):
         raise HTTPException(
             503,
             detail={
@@ -348,26 +477,12 @@ def predict(
         raise HTTPException(400, f"日期格式错误，应为 YYYY-MM-DD，实际: {date}")
 
     try:
-        result = do_predict(date)
+        backend = resolve_backend(predictor)
+        result, model_version = do_predict(date, backend)
 
-        # 写入结果文件（覆盖同名日期）
-        os.makedirs(RESULTS_DIR, exist_ok=True)
-        json_path = os.path.join(RESULTS_DIR, f"prediction_{date}.json")
-        result_for_file = {
-            "date": result["date"],
-            "segments": {
-                seg: {
-                    "调频容量需求": vals["调频容量需求"],
-                    "边际排序价格": vals["边际排序价格"],
-                    "市场出清价格(预测均价)": vals["市场出清价格_预测均价"],
-                }
-                for seg, vals in result["segments"].items()
-            },
-        }
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(result_for_file, f, ensure_ascii=False, indent=4)
+        json_path = write_prediction_files(date, backend, result)
 
-        logger.info(f"[Predict] {date} → {json_path}")
+        logger.info(f"[Predict] {date} ({backend}) → {json_path}")
 
         return PredictionResponse(
             date=result["date"],
@@ -375,7 +490,7 @@ def predict(
                 seg: PredictionSegment(**vals)
                 for seg, vals in result["segments"].items()
             },
-            model_version=f"hidden_dim={state.hidden_dim}",
+            model_version=model_version,
             generated_at=datetime.now().isoformat(),
         )
 

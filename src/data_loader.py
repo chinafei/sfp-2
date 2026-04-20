@@ -317,6 +317,25 @@ def save_model_params(results_dir: str, params: dict):
     print(f"  [✓] 模型参数 → {path}")
 
 
+def save_normalizer(results_dir: str, loader: NPYDataLoader):
+    """保存训练阶段计算出的特征标准化参数。"""
+    required_attrs = ["_seq_mean", "_seq_std", "_stat_mean", "_stat_std"]
+    missing = [attr for attr in required_attrs if not hasattr(loader, attr)]
+    if missing:
+        raise RuntimeError(f"标准化参数尚未生成，缺失: {missing}")
+
+    path = os.path.join(results_dir, "normalizer.json")
+    payload = {
+        "seq_mean": loader._seq_mean.tolist(),
+        "seq_std": loader._seq_std.tolist(),
+        "stat_mean": loader._stat_mean.tolist(),
+        "stat_std": loader._stat_std.tolist(),
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    print(f"  [✓] 标准化参数 → {path}")
+
+
 def load_model_params(results_dir: str) -> dict:
     """从 params.json 读取模型参数（缺失则返回默认值）"""
     path = os.path.join(results_dir, "params.json")
