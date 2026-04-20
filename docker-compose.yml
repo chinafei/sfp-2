@@ -1,0 +1,53 @@
+version: "3.9"
+
+services:
+  sfp2:
+    build:
+      context: ../
+      dockerfile: sfp-2/Dockerfile
+    image: sfp-2:latest
+    container_name: sfp2-predict
+    ports:
+      - "9527:9527"
+    volumes:
+      # 原始数据（每日更新，只读）
+      # 容器内路径: /app/traindata
+      - type: bind
+        source: ../traindata
+        target: /app/traindata
+        read_only: true
+
+      # 模型权重（宿主机存放，只读）
+      # 容器内路径: /app/sfp-2/checkpoints
+      # 宿主机路径: /data/dev/dianli/sfp-2/checkpoints
+      - type: bind
+        source: ./checkpoints
+        target: /app/sfp-2/checkpoints
+        read_only: true
+
+      # 预测结果（宿主机持久化，可读写）
+      # 容器内路径: /app/sfp-2/results
+      # 宿主机路径: /data/dev/dianli/sfp-2/results
+      - type: bind
+        source: ./results
+        target: /app/sfp-2/results
+
+      # NPY 数据集（可选：持久化加速增量构建）
+      # 首次构建后建议开启，避免每次重启都重跑 NPY
+      # 取消注释以启用:
+      # - type: bind
+      #   source: ./datasets/npy
+      #   target: /app/sfp-2/datasets/npy
+
+    environment:
+      # traindata 根目录（容器内路径）
+      - SFP_TRAINDATA_ROOT=/app/traindata
+      # CUDA 可用时自动使用 GPU（需宿主机有 GPU）
+      - CUDA_VISIBLE_DEVICES=
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9527/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s

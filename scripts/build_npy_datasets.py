@@ -95,17 +95,26 @@ def align_timeseries_for_npy(df: pd.DataFrame, feature_cols: List[str], mode: st
     elif mode == "96point":
         work["timestamp"] = work["timestamp"].dt.floor("15min")
         work = work.drop_duplicates(subset=["timestamp"], keep="last")
-        rows = []
-        for day, g in work.groupby(work["timestamp"].dt.floor("D")):
-            day_index = pd.date_range(day, day + pd.Timedelta(hours=23, minutes=45), freq="15min")
-            gg = g.set_index("timestamp").reindex(day_index)
-            if feature_cols:
-                gg[feature_cols] = gg[feature_cols].interpolate(method="linear", limit_direction="both")
-                gg[feature_cols] = gg[feature_cols].ffill().bfill()
-            gg = gg.reset_index().rename(columns={"index": "timestamp"})
-            rows.append(gg)
-        aligned = pd.concat(rows, ignore_index=True) if rows else work.copy()
-        aligned["timestamp"] = pd.to_datetime(aligned["timestamp"]).dt.strftime("%Y-%m-%d %H:%M:%S")
+        work = work.set_index("timestamp").sort_index()
+
+        # 构建完整的 15min 时间索引，只覆盖数据中实际出现的天
+        existing_days = work.index.floor("D").unique().sort_values()
+        full_index_parts = [
+            pd.date_range(day, day + pd.Timedelta(hours=23, minutes=45), freq="15min")
+            for day in existing_days
+        ]
+        full_index = full_index_parts[0].append(full_index_parts[1:]) if len(full_index_parts) > 1 else full_index_parts[0]
+        work = work.reindex(full_index)
+
+        # 向量化插值: 一次性对所有列做线性插值 + 前后填充
+        if feature_cols:
+            work[feature_cols] = work[feature_cols].interpolate(
+                method="linear", limit_direction="both", axis=0
+            )
+            work[feature_cols] = work[feature_cols].ffill().bfill()
+
+        aligned = work.reset_index().rename(columns={"index": "timestamp"})
+        aligned["timestamp"] = aligned["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S")
     else:
         aligned = work.copy()
         aligned["timestamp"] = pd.to_datetime(aligned["timestamp"]).dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -235,70 +244,120 @@ class ColumnIndexer:
 # ═══════════════════════════════════════════════════════
 #  4. 读取 & 合并两个时段的 CSV
 # ═══════════════════════════════════════════════════════
+def _read_csv_if_has_timestamp(csv_path: str):
+    """读取单个 CSV，若含 timestamp 列则返回 df，否则 None。"""
+    try:
+        df = pd.read_csv(csv_path)
+        if "timestamp" in df.columns:
+            return df
+    except Exception:
+        pass
+    return None
+
+
 def load_csvs_for_folder(folder_name: str) -> pd.DataFrame:
-    """在 PERIOD_DIRS 里找同名子目录，读取所有 csv 合并 (多part横/纵)。
-    只合并含 timestamp 列的 CSV；映射表类 CSV 自动跳过。"""
-    frames = []
+    """在 PERIOD_DIRS 里找同名子目录，读取所有 csv 合并。
+
+    优化策略:
+    - 对横向合并场景(大量 part 文件各有不同列): 采用流式策略,
+      先扫描所有文件获取列名和时间索引, 预分配 numpy 数组,
+      再逐 part 填充, 避免 DataFrame 级别的 merge/concat.
+    - 使用多进程并行读取 CSV 文件加速 I/O.
+    """
+    from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+    import gc
+
+    # 收集所有待处理的 CSV 文件路径
+    all_files = []
     for pd_dir in PERIOD_DIRS:
         sub = pd_dir / folder_name
         if not sub.exists():
             continue
-        csvs = sorted(sub.glob("*.csv"))
-        if not csvs:
-            continue
+        files = sorted(sub.glob("*.csv"))
+        all_files.extend(files)
 
-        # 只保留含 timestamp 列的文件
-        parts = []
-        for c in csvs:
-            try:
-                part = pd.read_csv(str(c))
-            except Exception:
-                continue
-            if "timestamp" not in part.columns:
-                continue  # 跳过映射表
-            parts.append(part)
-
-        if not parts:
-            continue
-
-        # 判断是否同结构纵向拼接还是横向拼接
-        all_same_cols = all(
-            set(p.columns) == set(parts[0].columns) for p in parts
-        )
-        if all_same_cols:
-            df = pd.concat(parts, ignore_index=True)
-        else:
-            # 横向拼接 (节点边际电价 part1…14, 机组实际发电曲线 part1…N)
-            df = parts[0]
-            for p in parts[1:]:
-                new_cols = [c for c in p.columns if c not in df.columns]
-                if not new_cols:
-                    # 所有列已存在 → 纵向追加
-                    df = pd.concat([df, p], ignore_index=True)
-                else:
-                    new_cols_with_ts = ["timestamp"] + new_cols
-                    df = df.merge(p[new_cols_with_ts], on="timestamp", how="outer")
-        frames.append(df)
-
-    if not frames:
+    if not all_files:
         return pd.DataFrame()
 
-    # 跨时段纵向拼接
-    all_cols_same = all(
-        set(f.columns) == set(frames[0].columns) for f in frames
-    )
-    if all_cols_same:
-        result = pd.concat(frames, ignore_index=True)
-    else:
-        # 列可能略有差异（28组比21组多一些列），做 outer 合并
-        if "timestamp" in frames[0].columns:
-            result = frames[0]
-            for f in frames[1:]:
-                result = pd.concat([result, f], ignore_index=True)
-        else:
-            result = pd.concat(frames, ignore_index=True)
+    # ── Phase 1: 并行读取所有 CSV (使用线程池)
+    parts = []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(_read_csv_if_has_timestamp, str(c)) for c in all_files]
+        for fut in futures:
+            result = fut.result()
+            if result is not None:
+                parts.append(result)
 
-    # 去重
+    if not parts:
+        return pd.DataFrame()
+
+    # ── Phase 2: 判断合并策略
+    ref_cols = set(parts[0].columns)
+    all_same_cols = all(set(p.columns) == ref_cols for p in parts)
+
+    if all_same_cols:
+        # 纯纵向拼接 (同结构)
+        result = pd.concat(parts, ignore_index=True)
+        del parts
+        gc.collect()
+    else:
+        # 横向合并场景 — 使用流式 numpy 填充
+        # Step 1: 扫描所有列名和全局时间索引
+        all_feature_cols = []  # 保持有序, 去重
+        seen_feature_cols = set()
+        all_timestamps = set()
+
+        for p in parts:
+            if "timestamp" in p.columns:
+                all_timestamps.update(p["timestamp"].values)
+            for c in p.columns:
+                if c != "timestamp" and c not in seen_feature_cols:
+                    all_feature_cols.append(c)
+                    seen_feature_cols.add(c)
+
+        # Step 2: 构建时间索引映射
+        sorted_timestamps = sorted(all_timestamps)
+        ts_to_idx = {ts: i for i, ts in enumerate(sorted_timestamps)}
+        n_rows = len(sorted_timestamps)
+        n_cols = len(all_feature_cols)
+        col_to_idx = {c: i for i, c in enumerate(all_feature_cols)}
+
+        # Step 3: 预分配 numpy 数组, 用 NaN 填充
+        arr = np.full((n_rows, n_cols), np.nan, dtype=np.float32)
+
+        # Step 4: 逐 part 填充数组后立即释放 DataFrame
+        for p in parts:
+            if "timestamp" not in p.columns:
+                continue
+            ts_vals = p["timestamp"].values
+            feature_cols_in_part = [c for c in p.columns if c != "timestamp"]
+
+            # 获取行索引映射
+            row_indices = np.array([ts_to_idx.get(t, -1) for t in ts_vals], dtype=np.int64)
+            valid_mask = row_indices >= 0
+
+            # 获取列索引映射
+            col_indices = [col_to_idx[c] for c in feature_cols_in_part if c in col_to_idx]
+            part_col_names = [c for c in feature_cols_in_part if c in col_to_idx]
+
+            if not col_indices or not valid_mask.any():
+                continue
+
+            # 批量填充
+            valid_rows = row_indices[valid_mask]
+            data_block = p[part_col_names].values[valid_mask].astype(np.float32)
+            arr[np.ix_(valid_rows, col_indices)] = data_block
+
+        del parts
+        gc.collect()
+
+        # Step 5: 转回 DataFrame (仅用于后续 align_timeseries_for_npy 兼容)
+        result = pd.DataFrame(arr, columns=all_feature_cols)
+        result.insert(0, "timestamp", sorted_timestamps)
+        del arr
+        gc.collect()
+
+    # ── 去重
     if "timestamp" in result.columns:
         result = result.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
 
@@ -330,12 +389,26 @@ def load_mapping_csvs(folder_name: str) -> pd.DataFrame:
 # ═══════════════════════════════════════════════════════
 #  6. 主处理逻辑
 # ═══════════════════════════════════════════════════════
-def process_all():
+def process_all(incremental=True):
     print("=" * 60)
-    print(" 数据处理流水线 — 开始")
+    print(" 数据处理流水线 — 开始" +
+          (" (增量模式)" if incremental else " (全量模式)"))
     print("=" * 60)
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 增量模式: 收集已有的数据集目录
+    existing_ids = set()
+    if incremental:
+        for d in OUT_DIR.iterdir():
+            if d.is_dir() and d.name[0].isdigit():
+                try:
+                    existing_ids.add(int(d.name.split("_", 1)[0]))
+                except ValueError:
+                    pass
+        if existing_ids:
+            print(f"\n  [增量] 已存在 {len(existing_ids)} 个数据集，"
+                  f"将跳过已有目录\n")
 
     # 6.1 读取规则
     rules = load_processing_rules()
@@ -383,6 +456,21 @@ def process_all():
 
         dir_label = f"{seq:02d}_{page}"
         out_sub = OUT_DIR / dir_label
+
+        # 增量跳过: 如果目录已存在且有 data.npy，跳过处理
+        if incremental and out_sub.exists() and (out_sub / "data.npy").exists():
+            print(f"  [{seq:02d}] {page}  (跳过，已存在)")
+            dataset_registry.append({
+                "dataset_id": seq,
+                "name": page,
+                "dir": dir_label,
+                "data_attr": data_attr,
+                "time_attr": time_attr,
+                "mechanism": mechanism,
+                "usage": usage,
+            })
+            continue
+
         out_sub.mkdir(parents=True, exist_ok=True)
 
         # ---- 分支处理 ----
@@ -628,5 +716,16 @@ def process_all():
     print("=" * 60)
 
 
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="将 traindata CSV 转为 NPY 数据集")
+    parser.add_argument(
+        "--no-incremental", dest="incremental", action="store_false", default=True,
+        help="禁用增量模式，全量重跑所有数据集"
+    )
+    args = parser.parse_args()
+    process_all(incremental=args.incremental)
+
+
 if __name__ == "__main__":
-    process_all()
+    main()

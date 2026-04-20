@@ -1,0 +1,25 @@
+version: "3.3"
+
+services:
+  sfp2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sfp-2:latest
+    container_name: sfp2-predict
+    ports:
+      - "9527:9527"
+    volumes:
+      - ./traindata:/app/traindata:ro
+      - ./sfp-2/checkpoints:/app/sfp-2/checkpoints:ro
+      - ./sfp-2/results:/app/sfp-2/results
+      - ./sfp-2/datasets/npy:/app/sfp-2/datasets/npy
+    environment:
+      - SFP_TRAINDATA_ROOT=/app/traindata
+      - CUDA_VISIBLE_DEVICES=
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9527/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5

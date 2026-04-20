@@ -1,0 +1,6 @@
+{
+  "hidden_dim": 128,
+  "lr": 0.001,
+  "batch_size": 32,
+  "penalty_weight": 10.0
+}
